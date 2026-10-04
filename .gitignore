@@ -1,0 +1,17 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller build cache (dist/ se incluye por peticion)
+build/
+*.manifest
+*.spec.bak
+
+# Logs y temporales
+*.log
+scratch/
+
+# OS generated
+.DS_Store
+Thumbs.db
