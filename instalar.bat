@@ -59,7 +59,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$s3 = $ws.CreateShortcut(\"$start\Widget Notas Win11.lnk\"); " ^
     "$s3.TargetPath = $target; " ^
     "$s3.IconLocation = \"$target,0\"; " ^
-    "$s3.Save();"
+    "$s3.Save(); " ^
+    "$startup = [System.Environment]::GetFolderPath('Startup'); " ^
+    "$s4 = $ws.CreateShortcut(\"$startup\Widget Notas Win11.lnk\"); " ^
+    "$s4.TargetPath = $target; " ^
+    "$s4.IconLocation = \"$target,0\"; " ^
+    "$s4.Save();"
 
 echo [4/4] Configurando menu contextual anticlick para .txt, .html y .htm...
 set "EXE_PATH=%INSTALL_DIR%\Widget-Notas-Win11.exe"

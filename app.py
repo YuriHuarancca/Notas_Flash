@@ -1,13 +1,31 @@
 import os
 import sys
+
+# Optimizar arranque de WebView2 (Chromium) desactivando servicios innecesarios para widget local
+os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = (
+    '--disable-background-networking '
+    '--disable-background-timer-throttling '
+    '--disable-breakpad '
+    '--disable-component-update '
+    '--disable-domain-reliability '
+    '--disable-features=Translate,OptimizationHints,MediaRouter '
+    '--disable-sync '
+    '--no-default-browser-check '
+    '--disable-search-engine-choice-screen'
+)
+
 import json
 import re
 import time
 import threading
+import socket
 from datetime import datetime
 import ctypes
 from ctypes import wintypes
 import webview
+
+g_tray = None
+IPC_PORT = 49281
 
 def get_minimal_timestamp():
     return datetime.now().strftime("%d/%m · %H:%M")
@@ -32,6 +50,21 @@ user32.SendMessageW.restype = wintypes.LPARAM
 user32.ReleaseCapture.argtypes = []
 user32.ReleaseCapture.restype = wintypes.BOOL
 
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype = wintypes.HWND
+
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+user32.AttachThreadInput.restype = wintypes.BOOL
+
+user32.BringWindowToTop.argtypes = [wintypes.HWND]
+user32.BringWindowToTop.restype = wintypes.BOOL
+
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindowVisible.restype = wintypes.BOOL
+
 # Constantes Win32
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
@@ -40,7 +73,57 @@ SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
+SW_HIDE = 0
+SW_SHOWNORMAL = 1
+SW_SHOW = 5
 SW_MINIMIZE = 6
+SW_RESTORE = 9
+
+def try_send_to_existing_instance(args):
+    """Verifica si ya existe una instancia activa en segundo plano. Si existe, le envia la orden y retorna True."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.35)
+        s.connect(('127.0.0.1', IPC_PORT))
+        req = {'magic': 'WIDGET_NOTAS_WIN11', 'action': 'open', 'args': list(args)}
+        s.sendall(json.dumps(req).encode('utf-8'))
+        ack = s.recv(1024).decode('utf-8')
+        s.close()
+        if ack == 'OK':
+            return True
+    except Exception:
+        pass
+    return False
+
+def start_ipc_server(api):
+    """Inicia el servidor local IPC para recibir peticiones de nuevas aperturas en 0.01 segundos."""
+    def server_loop():
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(('127.0.0.1', IPC_PORT))
+            srv.listen(5)
+            while True:
+                conn, _ = srv.accept()
+                try:
+                    raw = conn.recv(65536).decode('utf-8')
+                    if raw:
+                        payload = json.loads(raw)
+                        if payload.get('magic') == 'WIDGET_NOTAS_WIN11':
+                            conn.sendall(b'OK')
+                            args = payload.get('args', [])
+                            file_cand = args[0] if args and args[0] else None
+                            threading.Thread(target=api.show_and_activate, args=(file_cand,), daemon=True).start()
+                except Exception as e:
+                    print(f"IPC error: {e}")
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"IPC server bind error: {e}")
+    threading.Thread(target=server_loop, daemon=True).start()
 
 def get_resource_path(relative_path):
     """Obtiene la ruta absoluta al recurso, compatible con PyInstaller (_MEIPASS) y ejecución directa."""
@@ -51,6 +134,32 @@ def get_resource_path(relative_path):
 APPDATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'win11-widget-notes')
 os.makedirs(APPDATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(APPDATA_DIR, 'widget-data.json')
+RECOVERY_FILE = os.path.join(APPDATA_DIR, 'widget-recovery.json')
+EMERGENCY_BACKUP_HTML = os.path.join(APPDATA_DIR, 'ultimo-respaldo-seguridad.html')
+BACKUP_DIR = os.path.join(APPDATA_DIR, 'backups')
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+def make_safety_backup(content, title, file_path=None):
+    """Crea una copia de seguridad timestamped e inmutable de la nota en segundo plano."""
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        slug = "".join(c for c in (title or 'nota') if c.isalnum() or c in (' ', '_', '-')).strip()
+        fname = f"backup_{ts}_{slug[:25]}.html"
+        full_path = os.path.join(BACKUP_DIR, fname)
+        with open(full_path, 'w', encoding='utf-8') as f:
+            f.write(f"<!-- Respaldo de seguridad automatico: {datetime.now()} | Archivo: {file_path or 'Widget'} -->\n")
+            f.write(f"<h2>{escape_html(title or 'Nota')}</h2>\n")
+            f.write(f"<div>{content or ''}</div>\n")
+        # Mantener historial de maximo 25 copias
+        items = sorted(os.listdir(BACKUP_DIR))
+        if len(items) > 25:
+            for old in items[:-25]:
+                try:
+                    os.remove(os.path.join(BACKUP_DIR, old))
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"Error creating safety backup: {e}")
 
 SPANISH_MONTHS = {
     1: 'Ene', 2: 'Feb', 3: 'Mar', 4: 'Abr', 5: 'May', 6: 'Jun',
@@ -90,7 +199,7 @@ def get_notes_folder():
     return target
 
 EXAMPLE_CONTENT = (
-    '<h2>📌 Mi Widget de Notas</h2>'
+    '<h2>Mi Widget de Notas</h2>'
     '<p>Bienvenido a tu editor para el escritorio de Windows 11.</p>'
     '<ul><li>Haz listas con viñetas</li><li>Organiza tus ideas</li></ul>'
     '<ol><li>Primer paso importante</li><li>Segundo paso del día</li></ol>'
@@ -98,7 +207,7 @@ EXAMPLE_CONTENT = (
     '<li data-checked="false">Nueva tarea por hacer (haz clic para marcar)</li>'
     '<li data-checked="true">Tarea completada</li>'
     '</ul>'
-    '<p>¡Usa el botón de anclaje para mantenerlo siempre visible!</p>'
+    '<p>Usa el botón de anclaje para mantenerlo siempre visible en pantalla.</p>'
 )
 
 DEFAULT_DATA = {
@@ -135,10 +244,6 @@ def load_data():
                             json.dump(saved, wf, indent=2, ensure_ascii=False)
                     except Exception:
                         pass
-                else:
-                    # En lo sucesivo la app se abre en limpio
-                    saved['content'] = ''
-                    saved['title'] = get_minimal_timestamp()
 
                 return {**DEFAULT_DATA, **saved}
     except Exception as e:
@@ -182,11 +287,197 @@ def escape_html(text):
         .replace('"', '&quot;')
         .replace("'", '&#039;'))
 
+def write_note_to_file(file_path, note_data, chosen_title=None):
+    """Guarda directamente el contenido formateado de una nota en disco segun su extension."""
+    ext = os.path.splitext(file_path)[1].lower()
+    file_name = os.path.basename(file_path)
+    if not chosen_title:
+        chosen_title = os.path.splitext(file_name)[0]
+
+    if ext == '.txt':
+        raw_html = note_data.get('content', '')
+        clean_text = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
+        clean_text = re.sub(r'</p>', '\n', clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r'</li>', '\n', clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r'<[^>]+>', '', clean_text)
+        clean_text = clean_text.strip()
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(f"{chosen_title}\n{'=' * len(chosen_title)}\n\n{clean_text}\n")
+    elif ext in ('.html', '.htm') or ext not in ('.w11note', '.json'):
+        meta_json = json.dumps({
+            'version': '1.0',
+            'title': chosen_title,
+            'content': note_data.get('content', ''),
+            'theme': note_data.get('theme', 'theme-dark-mica'),
+            'fontSize': note_data.get('fontSize', 15.0)
+        }, ensure_ascii=False)
+
+        html_content = (
+            "<!DOCTYPE html>\n"
+            "<html lang='es'>\n"
+            "<head>\n"
+            "  <meta charset='UTF-8'>\n"
+            "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+            f"  <title>{chosen_title}</title>\n"
+            "  <style>\n"
+            "    :root { font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif; }\n"
+            "    body { font-family: inherit; background: #1c1e27; color: #f0f3f8; margin: 0; padding: 2rem 1rem; line-height: 1.6; }\n"
+            "    .document-card { max-width: 760px; margin: 0 auto; background: rgba(36, 39, 50, 0.95); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 12px; padding: 28px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4); }\n"
+            "    .note-header { border-bottom: 2px solid #0078d4; padding-bottom: 10px; margin-bottom: 20px; }\n"
+            "    .note-title { margin: 0; font-size: 1.6rem; font-weight: 700; color: #ffffff; }\n"
+            "    .note-body { font-size: 14px; color: #e4e7ee; }\n"
+            "    .note-body h1, .note-body h2, .note-body h3 { color: #60cdff; margin-top: 1.1em; margin-bottom: 0.4em; }\n"
+            "    .note-body p { margin: 0.5em 0; }\n"
+            "    .note-body ul, .note-body ol { padding-left: 24px; margin: 0.5em 0; }\n"
+            "    .note-body li { margin: 4px 0; }\n"
+            "    ul.task-list { list-style: none !important; padding-left: 0 !important; }\n"
+            "    ul.task-list li[data-checked='true'] { color: #8a90a0; text-decoration: none; opacity: 0.65; }\n"
+            "    ul.task-list li[data-checked='true']::before { content: '☑'; color: #107c41; font-weight: bold; font-size: 16px; margin-right: 6px; }\n"
+            "    ul.task-list li[data-checked='false']::before { content: '☐'; color: #8a90a0; font-weight: bold; font-size: 16px; margin-right: 6px; }\n"
+            "    img { max-width: 100%; height: auto; border-radius: 8px; margin: 10px auto; display: block; }\n"
+            "    @media print { body { background: #ffffff; color: #111111; padding: 0; } .document-card { box-shadow: none; border: none; padding: 0; } }\n"
+            "  </style>\n"
+            f"  <script type='application/json' id='w11note-data'>{meta_json}</script>\n"
+            "</head>\n"
+            "<body>\n"
+            "  <div class='document-card'>\n"
+            "    <div class='note-header'>\n"
+            f"      <h1 class='note-title'>{chosen_title}</h1>\n"
+            "    </div>\n"
+            f"    <div class='note-body'>{note_data.get('content', '')}</div>\n"
+            "  </div>\n"
+            "</body>\n"
+            "</html>"
+        )
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+    else:
+        payload = {
+            'version': '1.0',
+            'title': chosen_title,
+            'content': note_data.get('content', ''),
+            'theme': note_data.get('theme', 'theme-dark-mica'),
+            'fontSize': note_data.get('fontSize', 15.0)
+        }
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
 class JsApi:
     def __init__(self):
         self._window = None
         self._is_pinned = True
         self._opened_file_data = None
+        self._current_file_path = None
+        self._is_dirty = False
+        self._is_visible = True
+
+    def set_dirty(self, state):
+        self._is_dirty = bool(state)
+        return True
+
+    def is_dirty(self):
+        return getattr(self, '_is_dirty', False)
+
+    def set_current_file_path(self, path):
+        self._current_file_path = path or None
+        return True
+
+    def direct_save_file(self, note_data):
+        file_path = note_data.get('filePath') or getattr(self, '_current_file_path', None)
+        if not file_path:
+            return self.export_file(note_data)
+        try:
+            write_note_to_file(file_path, note_data)
+            self._current_file_path = file_path
+            self._is_dirty = False
+            self.mark_clean_exit()
+            make_safety_backup(note_data.get('content', ''), note_data.get('title', ''), file_path)
+            file_name = os.path.basename(file_path)
+            title = os.path.splitext(file_name)[0]
+            return {
+                'success': True,
+                'filePath': file_path,
+                'fileName': file_name,
+                'title': title
+            }
+        except Exception as e:
+            print(f"Error direct saving: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def save_recovery_snapshot(self, data):
+        try:
+            if not data:
+                return False
+            payload = {
+                'content': data.get('content', ''),
+                'title': data.get('title', ''),
+                'filePath': data.get('filePath') or getattr(self, '_current_file_path', None),
+                'theme': data.get('theme', 'theme-dark-mica'),
+                'fontSize': data.get('fontSize', 15.0),
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'timestampReadable': datetime.now().strftime("%d/%m · %H:%M"),
+                'isDirty': True,
+                'cleanExit': False
+            }
+            with open(RECOVERY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+
+            # Guardar copia de seguridad histórica inmutable
+            clean_text = re.sub(r'<[^>]+>', '', payload['content']).strip()
+            if len(clean_text) > 0:
+                make_safety_backup(payload['content'], payload['title'], payload['filePath'])
+
+            # Respaldo HTML directo legible
+            try:
+                with open(EMERGENCY_BACKUP_HTML, 'w', encoding='utf-8') as hf:
+                    hf.write(
+                        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                        f"<title>{payload['title']}</title></head><body>"
+                        f"<h1>{payload['title']}</h1>"
+                        f"<p><small>Respaldo de seguridad: {payload['timestamp']}</small></p>"
+                        f"<div class='note-body'>{payload['content']}</div>"
+                        "</body></html>"
+                    )
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            print(f"Error guardando snapshot de recuperacion: {e}")
+            return False
+
+    def check_recovery_snapshot(self):
+        try:
+            if os.path.exists(RECOVERY_FILE):
+                with open(RECOVERY_FILE, 'r', encoding='utf-8') as f:
+                    rec = json.load(f)
+                if rec and rec.get('isDirty') and not rec.get('cleanExit'):
+                    raw_content = rec.get('content', '')
+                    clean_text = re.sub(r'<[^>]+>', '', raw_content).strip()
+                    if len(clean_text) > 0:
+                        return rec
+        except Exception as e:
+            print(f"Error comprobando recuperacion: {e}")
+        return None
+
+    def mark_clean_exit(self):
+        try:
+            if os.path.exists(RECOVERY_FILE):
+                with open(RECOVERY_FILE, 'r', encoding='utf-8') as f:
+                    rec = json.load(f)
+                rec['cleanExit'] = True
+                rec['isDirty'] = False
+                with open(RECOVERY_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(rec, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def discard_recovery_snapshot(self):
+        try:
+            if os.path.exists(RECOVERY_FILE):
+                os.remove(RECOVERY_FILE)
+            return True
+        except Exception:
+            return False
 
     def set_window(self, window):
         self._window = window
@@ -277,6 +568,7 @@ class JsApi:
             data = dict(self._opened_file_data)
             data['alwaysOnTop'] = getattr(self, '_is_pinned', True)
             data['first_launch_done'] = True
+            self._current_file_path = data.get('filePath')
             return data
         data = load_data()
         data['alwaysOnTop'] = getattr(self, '_is_pinned', data.get('alwaysOnTop', True))
@@ -300,7 +592,9 @@ class JsApi:
         hwnd = self._get_hwnd()
         if hwnd:
             target = HWND_TOPMOST if on_top else HWND_NOTOPMOST
-            flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+            flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+            if getattr(self, '_is_visible', True):
+                flags |= SWP_SHOWWINDOW
             user32.SetWindowPos(hwnd, target, 0, 0, 0, 0, flags)
 
     def get_window_rect(self):
@@ -459,10 +753,91 @@ class JsApi:
         elif self._window:
             self._window.minimize()
 
+    def hide_window(self):
+        self.save_window_position()
+        hwnd = self._get_hwnd()
+        if hwnd:
+            user32.ShowWindow(hwnd, SW_HIDE)
+        elif self._window:
+            self._window.hide()
+        self._is_visible = False
+
     def close(self):
+        # Al hacer clic en X, ocultar en segundo plano para apertura inmediata (< 0.05s)
+        self.hide_window()
+
+    def is_window_visible(self):
+        hwnd = self._get_hwnd()
+        if hwnd:
+            return bool(user32.IsWindowVisible(hwnd))
+        return getattr(self, '_is_visible', True)
+
+    def toggle_visibility(self):
+        if self.is_window_visible():
+            self.hide_window()
+        else:
+            self.show_and_activate()
+
+    def show_and_activate(self, file_cand=None):
+        self._is_visible = True
+        hwnd = self._get_hwnd()
+        if hwnd:
+            try:
+                cur_fore = user32.GetForegroundWindow()
+                cur_thread = user32.GetWindowThreadProcessId(cur_fore, None) if cur_fore else 0
+                app_thread = user32.GetWindowThreadProcessId(hwnd, None)
+                if cur_thread and app_thread and cur_thread != app_thread:
+                    user32.AttachThreadInput(cur_thread, app_thread, True)
+                    user32.ShowWindow(hwnd, SW_RESTORE)
+                    user32.ShowWindow(hwnd, SW_SHOW)
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetForegroundWindow(hwnd)
+                    user32.AttachThreadInput(cur_thread, app_thread, False)
+                else:
+                    user32.ShowWindow(hwnd, SW_RESTORE)
+                    user32.ShowWindow(hwnd, SW_SHOW)
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetForegroundWindow(hwnd)
+            except Exception:
+                user32.ShowWindow(hwnd, SW_SHOW)
+                user32.SetForegroundWindow(hwnd)
+
+            self._apply_pin(getattr(self, '_is_pinned', True))
+            self._uncloak_window()
+
+        if self._window:
+            if file_cand and os.path.isfile(file_cand):
+                norm_cand = os.path.normcase(os.path.abspath(file_cand))
+                cur_norm = os.path.normcase(os.path.abspath(self._current_file_path)) if getattr(self, '_current_file_path', None) else None
+                if cur_norm and cur_norm == norm_cand:
+                    # El archivo ya esta abierto en esta misma ventana
+                    self._window.evaluate_js("window.notifyAlreadyOpen && window.notifyAlreadyOpen();")
+                else:
+                    note_data = self._read_file_content(file_cand)
+                    if note_data:
+                        self._window.evaluate_js(f"window.requestOpenFile && window.requestOpenFile({json.dumps(note_data)});")
+
+            self._window.evaluate_js("window.triggerEntranceAnimation && window.triggerEntranceAnimation();")
+
+    def new_blank_note(self):
+        self._current_file_path = None
+        self.show_and_activate()
+        if self._window:
+            self._window.evaluate_js("window.newBlankNote && window.newBlankNote();")
+
+    def full_exit(self):
+        self.mark_clean_exit()
+        global g_tray
+        if g_tray:
+            try:
+                g_tray.Visible = False
+                g_tray.Dispose()
+            except Exception:
+                pass
         self.save_window_position()
         if self._window:
             self._window.destroy()
+        os._exit(0)
 
     def export_file(self, note_data):
         if not self._window:
@@ -502,78 +877,16 @@ class JsApi:
 
         file_path = result if isinstance(result, str) else result[0]
         try:
-            ext = os.path.splitext(file_path)[1].lower()
             file_name = os.path.basename(file_path)
             folder_path = os.path.dirname(file_path)
             chosen_title = os.path.splitext(file_name)[0]
 
-            if ext == '.txt':
-                raw_html = note_data.get('content', '')
-                clean_text = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
-                clean_text = re.sub(r'</p>', '\n', clean_text, flags=re.IGNORECASE)
-                clean_text = re.sub(r'</li>', '\n', clean_text, flags=re.IGNORECASE)
-                clean_text = re.sub(r'<[^>]+>', '', clean_text)
-                clean_text = clean_text.strip()
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(f"{chosen_title}\n{'=' * len(chosen_title)}\n\n{clean_text}\n")
-            elif ext in ('.html', '.htm') or ext not in ('.w11note', '.json'):
-                meta_json = json.dumps({
-                    'version': '1.0',
-                    'title': chosen_title,
-                    'content': note_data.get('content', ''),
-                    'theme': note_data.get('theme', 'theme-dark-mica'),
-                    'fontSize': note_data.get('fontSize', 15.0)
-                }, ensure_ascii=False)
+            write_note_to_file(file_path, note_data, chosen_title=chosen_title)
 
-                html_content = (
-                    "<!DOCTYPE html>\n"
-                    "<html lang='es'>\n"
-                    "<head>\n"
-                    "  <meta charset='UTF-8'>\n"
-                    "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
-                    f"  <title>{chosen_title}</title>\n"
-                    "  <style>\n"
-                    "    :root { font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif; }\n"
-                    "    body { font-family: inherit; background: #1c1e27; color: #f0f3f8; margin: 0; padding: 2rem 1rem; line-height: 1.6; }\n"
-                    "    .document-card { max-width: 760px; margin: 0 auto; background: rgba(36, 39, 50, 0.95); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 12px; padding: 28px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4); }\n"
-                    "    .note-header { border-bottom: 2px solid #0078d4; padding-bottom: 10px; margin-bottom: 20px; }\n"
-                    "    .note-title { margin: 0; font-size: 1.6rem; font-weight: 700; color: #ffffff; }\n"
-                    "    .note-body { font-size: 14px; color: #e4e7ee; }\n"
-                    "    .note-body h1, .note-body h2, .note-body h3 { color: #60cdff; margin-top: 1.1em; margin-bottom: 0.4em; }\n"
-                    "    .note-body p { margin: 0.5em 0; }\n"
-                    "    .note-body ul, .note-body ol { padding-left: 24px; margin: 0.5em 0; }\n"
-                    "    .note-body li { margin: 4px 0; }\n"
-                    "    ul.task-list { list-style: none !important; padding-left: 0 !important; }\n"
-                    "    ul.task-list li[data-checked='true'] { color: #8a90a0; text-decoration: none; opacity: 0.65; }\n"
-                    "    ul.task-list li[data-checked='true']::before { content: '☑'; color: #107c41; font-weight: bold; font-size: 16px; margin-right: 6px; }\n"
-                    "    ul.task-list li[data-checked='false']::before { content: '☐'; color: #8a90a0; font-weight: bold; font-size: 16px; margin-right: 6px; }\n"
-                    "    img { max-width: 100%; height: auto; border-radius: 8px; margin: 10px auto; display: block; }\n"
-                    "    @media print { body { background: #ffffff; color: #111111; padding: 0; } .document-card { box-shadow: none; border: none; padding: 0; } }\n"
-                    "  </style>\n"
-                    f"  <script type='application/json' id='w11note-data'>{meta_json}</script>\n"
-                    "</head>\n"
-                    "<body>\n"
-                    "  <div class='document-card'>\n"
-                    "    <div class='note-header'>\n"
-                    f"      <h1 class='note-title'>{chosen_title}</h1>\n"
-                    "    </div>\n"
-                    f"    <div class='note-body'>{note_data.get('content', '')}</div>\n"
-                    "  </div>\n"
-                    "</body>\n"
-                    "</html>"
-                )
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(html_content)
-            else:
-                payload = {
-                    'version': '1.0',
-                    'title': chosen_title,
-                    'content': note_data.get('content', ''),
-                    'theme': note_data.get('theme', 'theme-dark-mica'),
-                    'fontSize': note_data.get('fontSize', 15.0)
-                }
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(payload, f, indent=2, ensure_ascii=False)
+            self._current_file_path = file_path
+            self._is_dirty = False
+            self.mark_clean_exit()
+            make_safety_backup(note_data.get('content', ''), chosen_title, file_path)
 
             return {
                 'success': True,
@@ -607,19 +920,33 @@ class JsApi:
         file_path = result if isinstance(result, str) else result[0]
         data = self._read_file_content(file_path)
         if data:
+            self._current_file_path = file_path
             return {'success': True, 'data': data}
         return {'success': False, 'error': 'No se pudo leer el archivo'}
 
 def main():
+    # 1. Comprobar si ya existe una instancia activa en segundo plano (arranque instantáneo < 0.05s)
+    if try_send_to_existing_instance(sys.argv[1:]):
+        sys.exit(0)
+
     api = JsApi()
 
-    # Comprobar si se abrió pasando un archivo como argumento (Anticlick / Abrir con)
-    if len(sys.argv) > 1 and sys.argv[1]:
-        cand = sys.argv[1].strip('\"')
+    # Iniciar servidor local IPC para recibir llamadas de nuevas aperturas
+    start_ipc_server(api)
+
+    # Comprobar si se abrió en modo oculto explícito o con un archivo
+    start_hidden = any(arg.lower() in ('--hidden', '-h') for arg in sys.argv)
+    api._is_visible = not start_hidden
+    cli_files = [arg for arg in sys.argv[1:] if not arg.startswith('-')]
+    if cli_files:
+        cand = cli_files[0].strip('\"')
         if os.path.isfile(cand):
             file_data = api._read_file_content(cand)
             if file_data:
                 api._opened_file_data = file_data
+                api._current_file_path = cand
+                start_hidden = False
+                api._is_visible = True
 
     saved = load_data()
 
@@ -636,7 +963,6 @@ def main():
         sw = user32.GetSystemMetrics(0) or 1536
         sh = user32.GetSystemMetrics(1) or 864
 
-    # Dimensiones iniciales: Cuadrado compacto un poquito más grande (330x330), centrado en la pantalla
     side = 500
     width = side
     height = side
@@ -650,14 +976,12 @@ def main():
         b = saved['bounds']
         bw = b.get('width')
         bh = b.get('height')
-        # Restaurar tamaño si es un tamaño cuadrado razonable
         if bw and bh and 260 <= bw <= 520 and 260 <= bh <= 520:
             width = int(bw)
             height = int(bh)
         if b.get('x') is not None and b.get('y') is not None:
             cand_x = int(b['x'])
             cand_y = int(b['y'])
-            # Asegurar que esté dentro de la pantalla y no empujado al borde
             if 40 <= cand_x <= (sw - width - 40) and 40 <= cand_y <= (sh - height - 40):
                 x = cand_x
                 y = cand_y
@@ -679,7 +1003,7 @@ def main():
         y=y,
         min_size=(200, 30),
         frameless=True,
-        hidden=False,
+        hidden=start_hidden,
         easy_drag=False,
         shadow=True,
         transparent=False,
@@ -694,8 +1018,8 @@ def main():
         hwnd = api._get_hwnd()
         if hwnd:
             try:
-                # DWMWA_CLOAK = 13 -> 1 (Enmascara la ventana: elimina 100% el cuadro vacío inicial mientras WebView2 renderiza)
-                val = ctypes.c_int(1)
+                # Asegurar que el compositor no oculte la superficie DirectComposition
+                val = ctypes.c_int(0)
                 ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 13, ctypes.byref(val), 4)
             except Exception:
                 pass
@@ -704,10 +1028,11 @@ def main():
 
     def on_loaded():
         api._apply_pin(on_top)
+        api._uncloak_window()
         hwnd = api._get_hwnd()
         if hwnd:
             try:
-                # Activar la sombra nativa densa proyectada hacia la derecha inferior (CS_DROPSHADOW)
+                # Activar la sombra nativa densa CS_DROPSHADOW
                 GCL_STYLE = -26
                 CS_DROPSHADOW = 0x00020000
                 if hasattr(user32, 'SetClassLongPtrW'):
@@ -723,7 +1048,7 @@ def main():
             except Exception:
                 pass
             try:
-                # Extender marco DWM y forzar sombra activa en ventana sin bordes
+                # Extender marco DWM y forzar esquinas redondeadas
                 class MARGINS(ctypes.Structure):
                     _fields_ = [
                         ('cxLeftWidth', ctypes.c_int),
@@ -733,9 +1058,7 @@ def main():
                     ]
                 m = MARGINS(1, 1, 1, 1)
                 ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(m))
-                # DWMWA_NCRENDERING_POLICY = 2 -> DWMNCRP_ENABLED (fuerza renderizado de sombra profunda de ventana)
                 ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 2, ctypes.byref(ctypes.c_int(2)), 4)
-                # DWMWA_WINDOW_CORNER_PREFERENCE = 33 -> DWMWCP_ROUND (esquinas redondeadas)
                 ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 30, ctypes.byref(ctypes.c_int(2)), 4)
             except Exception:
                 pass
@@ -746,15 +1069,76 @@ def main():
             except Exception:
                 pass
 
-        # Temporizador de seguridad: si JS no desenmascara en 1.2s, asegurar visibilidad
+        # Inicializar icono en bandeja del sistema (System Tray) para segundo plano
+        global g_tray
+        try:
+            import clr
+            clr.AddReference('System.Windows.Forms')
+            clr.AddReference('System.Drawing')
+            from System.Windows.Forms import (  # type: ignore
+                NotifyIcon,
+                ContextMenuStrip,
+                ToolStripMenuItem,
+                ToolStripSeparator,
+                MouseButtons
+            )
+            from System.Drawing import Icon  # type: ignore
+
+            g_tray = NotifyIcon()
+            icon_file = get_resource_path('icon.ico')
+            if os.path.exists(icon_file):
+                g_tray.Icon = Icon(icon_file)
+            g_tray.Text = "Widget de Notas (Clic para abrir)"
+            g_tray.Visible = True
+
+            tray_menu = ContextMenuStrip()
+            m_show = ToolStripMenuItem("Abrir Widget de Notas")
+            m_show.Click += lambda s, e: api.show_and_activate()
+
+            m_new = ToolStripMenuItem("Nueva nota en blanco")
+            m_new.Click += lambda s, e: api.new_blank_note()
+
+            m_hide = ToolStripMenuItem("Ocultar en segundo plano")
+            m_hide.Click += lambda s, e: api.hide_window()
+
+            m_exit = ToolStripMenuItem("Cerrar completamente")
+            m_exit.Click += lambda s, e: api.full_exit()
+
+            tray_menu.Items.Add(m_show)
+            tray_menu.Items.Add(m_new)
+            tray_menu.Items.Add(m_hide)
+            tray_menu.Items.Add(ToolStripSeparator())
+            tray_menu.Items.Add(m_exit)
+            g_tray.ContextMenuStrip = tray_menu
+
+            def on_tray_mouse_click(s, e):
+                if e.Button == MouseButtons.Left:
+                    api.toggle_visibility()
+            g_tray.MouseClick += on_tray_mouse_click
+        except Exception as e:
+            print(f"Error initializing system tray: {e}")
+
         def safety_uncloak():
-            time.sleep(1.2)
+            time.sleep(0.2)
             api._uncloak_window()
         threading.Thread(target=safety_uncloak, daemon=True).start()
 
+    def on_closing():
+        try:
+            if api.is_dirty():
+                api.show_and_activate()
+                api._window.evaluate_js("window.handleCloseRequest && window.handleCloseRequest();")
+                return False
+        except Exception:
+            pass
+        api.mark_clean_exit()
+        api.save_window_position()
+        return True
+
+    window.events.closing += on_closing
     window.events.loaded += on_loaded
 
-    # Iniciar WebView2 con caché persistente para arranque ultra rápido en < 1 segundo
+    # Iniciar WebView2 con caché persistente
     webview.start(private_mode=False, storage_path=APPDATA_DIR, debug=False)
 
 if __name__ == '__main__':

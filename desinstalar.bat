@@ -26,10 +26,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$pubDesk = [System.Environment]::GetFolderPath('CommonDesktopDirectory'); " ^
     "$start = [System.Environment]::GetFolderPath('CommonPrograms'); " ^
     "$uStart = [System.Environment]::GetFolderPath('Programs'); " ^
+    "$startup = [System.Environment]::GetFolderPath('Startup'); " ^
     "Remove-Item -Path \"$desk\Widget Notas Win11.lnk\" -Force -ErrorAction SilentlyContinue; " ^
     "Remove-Item -Path \"$pubDesk\Widget Notas Win11.lnk\" -Force -ErrorAction SilentlyContinue; " ^
     "Remove-Item -Path \"$start\Widget Notas Win11.lnk\" -Force -ErrorAction SilentlyContinue; " ^
-    "Remove-Item -Path \"$uStart\Widget Notas Win11.lnk\" -Force -ErrorAction SilentlyContinue;"
+    "Remove-Item -Path \"$uStart\Widget Notas Win11.lnk\" -Force -ErrorAction SilentlyContinue; " ^
+    "Remove-Item -Path \"$startup\Widget Notas Win11.lnk\" -Force -ErrorAction SilentlyContinue;"
 
 echo [3/4] Eliminando asociaciones de menu anticlick y registros...
 for %%E in (.txt .html .htm .w11note) do (
